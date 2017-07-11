@@ -1,19 +1,19 @@
 {-# Language ForeignFunctionInterface, EmptyDataDecls, DeriveDataTypeable #-}
 module Database.KyotoCabinet.Foreign where
 
-import Control.Arrow (second)
-import Control.Applicative ((<$>), (<*>))
+import Control.Applicative ((<$>), (<*>), (<*))
 import Control.Exception (Exception, throwIO)
 import Data.Bits ((.|.))
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BS
 import Data.Data (Typeable)
 import Data.Int (Int32, Int64)
 import Foreign.C.String (CString, withCString, peekCString, withCString)
-import Foreign.C.Types (CSize, CInt)
+import Foreign.C.Types (CSize(..), CInt)
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Marshal.Array (withArrayLen, peekArray, allocaArray)
-import Foreign.Ptr (Ptr, nullPtr, FunPtr)
+import Foreign.Ptr (Ptr, nullPtr, FunPtr, castPtr)
 import Foreign.Storable (Storable (..))
 
 #include <kclangc.h>
@@ -59,7 +59,9 @@ instance Storable KCSTR where
     do arr <- #{peek KCSTR, buf} ptr
        size <- #{peek KCSTR, size} ptr
        return $ KCSTR (arr, size)
-  poke _ _ = error "Database.KyotoCabinet.Foreign.KCSTR.poke not implemented"
+  poke ptr (KCSTR (buf, size)) =
+    do #{poke KCSTR, buf}  ptr buf
+       #{poke KCSTR, size} ptr size
 
 withKCSTR :: ByteString -> (KCSTR -> IO a) -> IO a
 withKCSTR bs f = BS.unsafeUseAsCStringLen bs $ \(ptr, len) -> f (KCSTR (ptr, (fi len)))
@@ -91,13 +93,32 @@ instance Storable KCREC where
   sizeOf _ = #{size KCREC}
   alignment _ = alignment (undefined :: CInt)
   peek ptr =
-    do k <- #{peek KCREC, key} ptr >>= BS.unsafePackCStringLen . second fi . unKCSTR
-       v <- #{peek KCREC, value} ptr >>= BS.unsafePackCStringLen . second fi . unKCSTR
+    do k <- #{peek KCREC, key} ptr >>= unsafePackKCSTR
+       v <- #{peek KCREC, value} ptr >>= unsafePackKCSTR
        return $ KCREC (k, v)
   poke _ _ = error "Database.KyotoCabinet.Foreign.KCREC.poke not implemented"
 
-withKCRECArray :: [(ByteString, ByteString)] -> (CSize -> Ptr KCREC -> IO a) -> IO a
-withKCRECArray kvs f = withArrayLen (map KCREC kvs) (f . fi)
+newtype KCREC_ = KCREC_ {unKCREC_ :: (KCSTR, KCSTR)}
+
+instance Storable KCREC_ where
+  sizeOf _ = #{size KCREC}
+  alignment _ = alignment (undefined :: CInt)
+  peek _ = error "Database.KyotoCabinet.Foreign.KCREC_.peek not implemented"
+  poke ptr (KCREC_ (k, v)) = do
+    #{poke KCREC, key} ptr k
+    #{poke KCREC, value} ptr v
+
+withKCRECArray :: [(ByteString, ByteString)] -> (CSize -> Ptr KCREC_ -> IO a) -> IO a
+withKCRECArray kvs f = go kvs []
+  where
+  go [] kckvs = withArrayLen kckvs (f . fi)
+  go ((k, v) : kvs') kckvs =
+    withKCSTR k $ \key ->
+      withKCSTR v $ \val ->
+        go kvs' (KCREC_ (key, val) : kckvs)
+
+unsafePackKCSTR :: KCSTR -> IO ByteString
+unsafePackKCSTR (KCSTR (buf, size)) = BS.unsafePackCStringFinalizer (castPtr buf) (fi size) (kcfree buf)
 
 -------------------------------------------------------------------------------
 
@@ -172,7 +193,9 @@ getFun f db k =
   alloca $ \vlenptr ->
   do vptr <- f db kptr (fi klen) vlenptr
      if vptr == nullPtr then return Nothing
-       else peek vlenptr >>= \vlen -> fmap Just $ BS.unsafePackCStringLen (vptr, fi vlen)
+       else peek vlenptr >>= \vlen -> fmap Just $ BS.unsafePackCStringFinalizer (castPtr vptr) (fi vlen) (kcfree vptr)
+foreign import ccall "kclangc.h kcfree"
+  kcfree :: Ptr a -> IO ()
 
 -------------------------------------------------------------------------------
 
@@ -290,7 +313,7 @@ kcdbsetbulk db kvs atomic =
   withKCRECArray kvs $ \len kcrecptr ->
   kcdbsetbulk' db kcrecptr len (boolToInt atomic) >>= handleCountResult db "kcdbsetbulk"
 foreign import ccall "kclangc.h kcdbsetbulk"
-  kcdbsetbulk' :: Ptr KCDB -> Ptr KCREC -> CSize -> Int32 -> IO Int64
+  kcdbsetbulk' :: Ptr KCDB -> Ptr KCREC_ -> CSize -> Int32 -> IO Int64
 
 kcdbremovebulk :: Ptr KCDB -> [ByteString] -> Bool -> IO Int64
 kcdbremovebulk db ks atomic =
@@ -355,6 +378,7 @@ kcdbpath db =
   do cstr <- kcdbpath' db
      if cstr == nullPtr then error "Database.KyotoCabinet.Foreign.kcdbpath: kcdbpath() returned NULL"
        else do path <- peekCString cstr
+               kcfree cstr
                if null path then throwKCException db "kcdbpath"
                  else return path
 foreign import ccall "kclangc.h kcdbpath"
@@ -364,7 +388,7 @@ kcdbstatus :: Ptr KCDB -> IO String
 kcdbstatus db =
   do cstr <- kcdbstatus' db
      if cstr == nullPtr then throwKCException db "kcdbstatus"
-       else peekCString cstr
+       else peekCString cstr <* kcfree cstr
 foreign import ccall "kclangc.h kcdbstatus"
   kcdbstatus' :: Ptr KCDB -> IO CString
 
@@ -415,7 +439,7 @@ kccurgetkey cur s =
   alloca $ \lenptr ->
   do cstr <- kccurgetkey' cur lenptr (boolToInt s) >>= handlePtrResultC cur "kccurgetkey"
      len <- peek lenptr
-     BS.unsafePackCStringLen (cstr, fi len)
+     unsafePackKCSTR (KCSTR (cstr, len))
 foreign import ccall "kclangc.h kccurgetkey"
   kccurgetkey' :: Ptr KCCUR -> Ptr CSize -> Int32 -> IO CString
 
@@ -424,7 +448,7 @@ kccurgetvalue cur s =
   alloca $ \lenptr ->
   do cstr <- kccurgetvalue' cur lenptr (boolToInt s) >>= handlePtrResultC cur "kccurget"
      len <- peek lenptr
-     BS.unsafePackCStringLen (cstr, fi len)
+     unsafePackKCSTR (KCSTR (cstr, len))
 foreign import ccall "kclangc.h kccurgetvalue"
   kccurgetvalue' :: Ptr KCCUR -> Ptr CSize -> Int32 -> IO CString
 
@@ -437,8 +461,10 @@ kccurget cur s =
      klen <- peek klenptr
      vstr <- peek vstrptr
      vlen <- peek vlenptr
-     k <- BS.unsafePackCStringLen (kstr, fi klen)
-     v <- BS.unsafePackCStringLen (vstr, fi vlen)
+     -- looks like the function allocates one buffer both for key and value, so only
+     -- pointer to key should be freed.
+     k <- unsafePackKCSTR (KCSTR (kstr, klen))
+     v <- BS.packCStringLen (vstr, fi vlen)
      return (k, v)
 foreign import ccall "kclangc.h kccurget"
   kccurget' :: Ptr KCCUR -> Ptr CSize -> Ptr CString -> Ptr CSize -> Int32 -> IO CString
@@ -452,8 +478,10 @@ kccurseize cur =
      klen <- peek klenptr
      vstr <- peek vstrptr
      vlen <- peek vlenptr
-     k <- BS.unsafePackCStringLen (kstr, fi klen)
-     v <- BS.unsafePackCStringLen (vstr, fi vlen)
+     -- looks like the function allocates one buffer both for key and value, so only
+     -- pointer to key should be freed.
+     k <- unsafePackKCSTR (KCSTR (kstr, klen))
+     v <- BS.packCStringLen (vstr, fi vlen)
      return (k, v)
 foreign import ccall "kclangc.h kccurseize"
   kccurseize' :: Ptr KCCUR -> Ptr CSize -> Ptr CString -> Ptr CSize -> IO CString

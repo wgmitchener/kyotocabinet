@@ -1,14 +1,19 @@
 Cabal-Version:          >= 1.6
 Name:                   kyotocabinet
-Version:                0.1.1
+Version:                0.1.4
 Author:                 Francesco Mazzoli (f@mazzo.li)
 Maintainer:             Francesco Mazzoli (f@mazzo.li)
 Build-Type:             Simple
 License:                BSD3
+License-File:           LICENSE
 Build-Type:             Simple
 Category:               Database
+Homepage:               https://github.com/bitonic/kyotocabinet
+Bug-Reports:            https://github.com/bitonic/kyotocabinet/issues
 Synopsis:               Mid level bindings to Kyoto Cabinet
-Tested-With:            GHC==7.2.2
+Tested-With:            GHC==7.8.3
+Extra-Source-Files:     cbits/utils.h
+                        changelog
 Description:
   Mid level bindings to Kyoto Cabinet, plus some wrappers data type for ease of use.
 
